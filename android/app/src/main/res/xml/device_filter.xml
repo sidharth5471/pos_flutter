@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- PineLabs A910 device -->
+    <usb-device class="255" subclass="255" protocol="255" />
+    <!-- Generic USB device -->
+    <usb-device class="255" />
+</resources> 
