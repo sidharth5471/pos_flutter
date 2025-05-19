@@ -9,7 +9,11 @@ import android.hardware.usb.*
 import android.os.Build
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
+import java.net.InetAddress
+import java.net.NetworkInterface
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class POSBridge(private val context: Context, private val channel: MethodChannel) {
     private val TAG = "POSBridge"
@@ -20,59 +24,143 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
     private var usbEndpointOut: UsbEndpoint? = null
     private var usbEndpointIn: UsbEndpoint? = null
     private var isDeviceInitialized = false
+    private val executor = Executors.newSingleThreadExecutor()
 
     init {
         usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     }
 
     fun scanForDevices(): List<Map<String, Any>> {
+        val devices = ArrayList<Map<String, Any>>()
+        
+        // First scan USB devices
         try {
-            val deviceList = usbManager?.deviceList ?: emptyMap()
-            val devices = ArrayList<Map<String, Any>>()
-
-            Log.d(TAG, "Scanning for USB devices...")
-            Log.d(TAG, "Found ${deviceList.size} USB devices")
-
-            if (deviceList.isEmpty()) {
-                Log.e(TAG, "No USB devices found")
-                channel.invokeMethod("onError", "No USB devices found. Please connect a POS device.")
-                return emptyList()
-            }
-
-            var foundPineLabsDevice = false
-            deviceList.values.forEach { device ->
-                Log.d(TAG, "Checking device: ${device.deviceName} (Vendor ID: ${device.vendorId}, Product ID: ${device.productId})")
-                
-                // For A910, we'll accept any USB device initially
-                foundPineLabsDevice = true
-                val deviceInfo = mapOf<String, Any>(
-                    "deviceId" to device.deviceId,
-                    "deviceName" to (device.deviceName ?: "Unknown Device"),
-                    "manufacturerName" to (device.manufacturerName ?: "Unknown Manufacturer"),
-                    "productName" to (device.productName ?: "Unknown Product"),
-                    "vendorId" to device.vendorId,
-                    "productId" to device.productId,
-                    "deviceClass" to device.deviceClass,
-                    "deviceSubclass" to device.deviceSubclass,
-                    "deviceProtocol" to device.deviceProtocol
-                )
-                Log.d(TAG, "Found device: $deviceInfo")
-                devices.add(deviceInfo)
-            }
-
-            if (!foundPineLabsDevice) {
-                Log.e(TAG, "No compatible device found")
-                channel.invokeMethod("onError", "No compatible device found. Please connect a POS device.")
-                return emptyList()
-            }
-
-            Log.d(TAG, "Returning ${devices.size} devices")
-            return devices
+            val usbDevices = scanUsbDevices()
+            devices.addAll(usbDevices)
         } catch (e: Exception) {
-            Log.e(TAG, "Error scanning for devices", e)
-            channel.invokeMethod("onError", "Error scanning for devices: ${e.message}")
+            Log.e(TAG, "Error scanning USB devices", e)
+        }
+
+        // Then scan network devices
+        try {
+            val networkDevices = scanNetworkDevices()
+            devices.addAll(networkDevices)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error scanning network devices", e)
+        }
+
+        return devices
+    }
+
+    private fun scanUsbDevices(): List<Map<String, Any>> {
+        val devices = ArrayList<Map<String, Any>>()
+        val deviceList = usbManager?.deviceList ?: emptyMap()
+
+        Log.d(TAG, "Scanning for USB devices...")
+        Log.d(TAG, "Found ${deviceList.size} USB devices")
+
+        if (deviceList.isEmpty()) {
+            Log.e(TAG, "No USB devices found")
             return emptyList()
         }
+
+        deviceList.values.forEach { device ->
+            Log.d(TAG, "Checking device: ${device.deviceName} (Vendor ID: ${device.vendorId}, Product ID: ${device.productId})")
+            
+            val deviceInfo = mapOf<String, Any>(
+                "deviceId" to device.deviceId,
+                "deviceName" to (device.deviceName ?: "Unknown Device"),
+                "manufacturerName" to (device.manufacturerName ?: "Unknown Manufacturer"),
+                "productName" to (device.productName ?: "Unknown Product"),
+                "vendorId" to device.vendorId,
+                "productId" to device.productId,
+                "deviceClass" to device.deviceClass,
+                "deviceSubclass" to device.deviceSubclass,
+                "deviceProtocol" to device.deviceProtocol,
+                "connectionType" to "USB"
+            )
+            Log.d(TAG, "Found device: $deviceInfo")
+            devices.add(deviceInfo)
+        }
+
+        return devices
+    }
+
+    private fun scanNetworkDevices(): List<Map<String, Any>> {
+        val devices = Collections.synchronizedList(ArrayList<Map<String, Any>>())
+        val networkInterfaces = NetworkInterface.getNetworkInterfaces()
+        val executor = Executors.newFixedThreadPool(10) // Use more threads for faster scanning
+        
+        Log.d(TAG, "Scanning for network devices...")
+
+        while (networkInterfaces.hasMoreElements()) {
+            val networkInterface = networkInterfaces.nextElement()
+            
+            // Skip loopback and inactive interfaces
+            if (networkInterface.isLoopback || !networkInterface.isUp) {
+                continue
+            }
+
+            val interfaceAddresses = networkInterface.inetAddresses
+            while (interfaceAddresses.hasMoreElements()) {
+                val address = interfaceAddresses.nextElement()
+                
+                // Only scan IPv4 addresses
+                if (address.hostAddress.contains(":")) {
+                    continue
+                }
+
+                val baseAddress = address.hostAddress.substring(0, address.hostAddress.lastIndexOf(".") + 1)
+                Log.d(TAG, "Scanning network interface: $baseAddress")
+                
+                // Scan the local network (last octet 1-254)
+                for (i in 1..254) {
+                    val targetAddress = "$baseAddress$i"
+                    executor.submit {
+                        try {
+                            val inetAddress = InetAddress.getByName(targetAddress)
+                            if (inetAddress.isReachable(500)) { // Reduced timeout for faster scanning
+                                Log.d(TAG, "Found reachable device at $targetAddress")
+                                // Try to connect to Pine Labs device port (default: 9100)
+                                val socket = java.net.Socket()
+                                try {
+                                    socket.connect(java.net.InetSocketAddress(inetAddress, 9100), 500)
+                                    val deviceInfo = mapOf<String, Any>(
+                                        "deviceId" to targetAddress.hashCode(),
+                                        "deviceName" to "Pine Labs Device",
+                                        "ipAddress" to targetAddress,
+                                        "port" to 9100,
+                                        "connectionType" to "NETWORK"
+                                    )
+                                    devices.add(deviceInfo)
+                                    Log.d(TAG, "Found network device: $deviceInfo")
+                                } catch (e: Exception) {
+                                    Log.d(TAG, "Device at $targetAddress is not a Pine Labs device: ${e.message}")
+                                } finally {
+                                    try {
+                                        socket.close()
+                                    } catch (e: Exception) {
+                                        // Ignore close errors
+                                    }
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // Skip unreachable addresses
+                        }
+                    }
+                }
+            }
+        }
+
+        // Wait for all scans to complete (with timeout)
+        executor.shutdown()
+        if (!executor.awaitTermination(15, TimeUnit.SECONDS)) { // Increased timeout
+            Log.w(TAG, "Network scan timed out, returning partial results")
+            executor.shutdownNow()
+        }
+
+        Log.d(TAG, "Network scan complete, found ${devices.size} devices")
+        return devices
     }
 
     private fun initializeDevice(): Boolean {
@@ -371,32 +459,68 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                 0x03  // ETX
             )
             
-            Log.d(TAG, "Sending ready command: ${readyCommand.joinToString(", ") { String.format("0x%02X", it) }}")
-            val readyResult = usbConnection?.bulkTransfer(usbEndpointOut, readyCommand, readyCommand.size, TIMEOUT)
-            Log.d(TAG, "Ready command result: $readyResult")
+            var attempts = 0
+            val maxAttempts = 3
             
-            if (readyResult != null && readyResult > 0) {
-                // Wait for ready response
-                Thread.sleep(1000)
+            while (attempts < maxAttempts) {
+                Log.d(TAG, "Ready check attempt ${attempts + 1}")
+                Log.d(TAG, "Sending ready command: ${readyCommand.joinToString(", ") { String.format("0x%02X", it) }}")
+                val readyResult = usbConnection?.bulkTransfer(usbEndpointOut, readyCommand, readyCommand.size, TIMEOUT)
+                Log.d(TAG, "Ready command result: $readyResult")
                 
-                val responseBuffer = ByteArray(1024)
-                val responseResult = usbConnection?.bulkTransfer(usbEndpointIn, responseBuffer, responseBuffer.size, TIMEOUT)
-                Log.d(TAG, "Ready response result: $responseResult")
-                
-                if (responseResult != null && responseResult > 0) {
-                    Log.d(TAG, "Ready response bytes: ${responseBuffer.take(responseResult).joinToString(", ") { String.format("0x%02X", it) }}")
-                    // Check if response indicates device is ready
-                    if (responseResult >= 8 && responseBuffer[0] == 0xCD.toByte() && responseBuffer[1] == 0xCD.toByte()) {
-                        return true
+                if (readyResult != null && readyResult > 0) {
+                    // Wait for ready response
+                    Thread.sleep(1000)
+                    
+                    val responseBuffer = ByteArray(1024)
+                    val responseResult = usbConnection?.bulkTransfer(usbEndpointIn, responseBuffer, responseBuffer.size, TIMEOUT)
+                    Log.d(TAG, "Ready response result: $responseResult")
+                    
+                    if (responseResult != null && responseResult > 0) {
+                        Log.d(TAG, "Ready response bytes: ${responseBuffer.take(responseResult).joinToString(", ") { String.format("0x%02X", it) }}")
+                        // Check if response indicates device is ready
+                        if (responseResult >= 8 && responseBuffer[0] == 0xCD.toByte() && responseBuffer[1] == 0xCD.toByte()) {
+                            Log.d(TAG, "Device is ready")
+                            return true
+                        } else {
+                            Log.d(TAG, "Invalid ready response format")
+                        }
+                    } else {
+                        Log.d(TAG, "No response from ready command")
                     }
+                } else {
+                    Log.d(TAG, "Failed to send ready command")
+                }
+                
+                attempts++
+                if (attempts < maxAttempts) {
+                    Log.d(TAG, "Retrying ready check...")
+                    Thread.sleep(1000) // Wait before retry
                 }
             }
             
-            // If we don't get a proper response, try to reinitialize the device
-            Log.d(TAG, "Device not ready, attempting reinitialization")
+            // If we get here, we didn't get a proper response
+            Log.e(TAG, "Device not ready after $maxAttempts attempts")
+            
+            // Try to reinitialize the device
+            Log.d(TAG, "Attempting device reinitialization")
             if (initializeDevice()) {
                 Log.d(TAG, "Device reinitialized successfully")
-                return true
+                // Try one more ready check after reinitialization
+                Thread.sleep(1000)
+                val finalReadyResult = usbConnection?.bulkTransfer(usbEndpointOut, readyCommand, readyCommand.size, TIMEOUT)
+                if (finalReadyResult != null && finalReadyResult > 0) {
+                    Thread.sleep(1000)
+                    val finalResponseBuffer = ByteArray(1024)
+                    val finalResponseResult = usbConnection?.bulkTransfer(usbEndpointIn, finalResponseBuffer, finalResponseBuffer.size, TIMEOUT)
+                    if (finalResponseResult != null && finalResponseResult > 0) {
+                        Log.d(TAG, "Final ready response bytes: ${finalResponseBuffer.take(finalResponseResult).joinToString(", ") { String.format("0x%02X", it) }}")
+                        if (finalResponseResult >= 8 && finalResponseBuffer[0] == 0xCD.toByte() && finalResponseBuffer[1] == 0xCD.toByte()) {
+                            Log.d(TAG, "Device is ready after reinitialization")
+                            return true
+                        }
+                    }
+                }
             }
             
             Log.e(TAG, "Device not ready and reinitialization failed")
@@ -407,11 +531,104 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
         }
     }
 
+    private fun cancelTransaction(): Boolean {
+        try {
+            Log.d(TAG, "Cancelling transaction...")
+            
+            // Send cancel command
+            val cancelCommand = byteArrayOf(
+                0x02, // STX
+                0x43, // 'C'
+                0x41, // 'A'
+                0x4E, // 'N'
+                0x43, // 'C'
+                0x45, // 'E'
+                0x4C, // 'L'
+                0x1C, // FS
+                0x03  // ETX
+            )
+            
+            Log.d(TAG, "Sending cancel command: ${cancelCommand.joinToString(", ") { String.format("0x%02X", it) }}")
+            val cancelResult = usbConnection?.bulkTransfer(usbEndpointOut, cancelCommand, cancelCommand.size, TIMEOUT)
+            Log.d(TAG, "Cancel command result: $cancelResult")
+            
+            if (cancelResult != null && cancelResult > 0) {
+                // Wait for cancel response
+                Thread.sleep(1000)
+                
+                val responseBuffer = ByteArray(1024)
+                val responseResult = usbConnection?.bulkTransfer(usbEndpointIn, responseBuffer, responseBuffer.size, TIMEOUT)
+                Log.d(TAG, "Cancel response result: $responseResult")
+                
+                if (responseResult != null && responseResult > 0) {
+                    Log.d(TAG, "Cancel response bytes: ${responseBuffer.take(responseResult).joinToString(", ") { String.format("0x%02X", it) }}")
+                    return true
+                }
+            }
+            
+            return false
+        } catch (e: Exception) {
+            Log.e(TAG, "Error cancelling transaction", e)
+            return false
+        }
+    }
+
+    private fun resetDevice(): Boolean {
+        try {
+            Log.d(TAG, "Resetting device...")
+            
+            // Send reset command
+            val resetCommand = byteArrayOf(
+                0x02, // STX
+                0x52, // 'R'
+                0x45, // 'E'
+                0x53, // 'S'
+                0x45, // 'E'
+                0x54, // 'T'
+                0x1C, // FS
+                0x03  // ETX
+            )
+            
+            Log.d(TAG, "Sending reset command: ${resetCommand.joinToString(", ") { String.format("0x%02X", it) }}")
+            val resetResult = usbConnection?.bulkTransfer(usbEndpointOut, resetCommand, resetCommand.size, TIMEOUT)
+            Log.d(TAG, "Reset command result: $resetResult")
+            
+            if (resetResult != null && resetResult > 0) {
+                // Wait for reset response
+                Thread.sleep(1000)
+                
+                val responseBuffer = ByteArray(1024)
+                val responseResult = usbConnection?.bulkTransfer(usbEndpointIn, responseBuffer, responseBuffer.size, TIMEOUT)
+                Log.d(TAG, "Reset response result: $responseResult")
+                
+                if (responseResult != null && responseResult > 0) {
+                    Log.d(TAG, "Reset response bytes: ${responseBuffer.take(responseResult).joinToString(", ") { String.format("0x%02X", it) }}")
+                    return true
+                }
+            }
+            
+            // If reset command fails, try to reinitialize
+            Log.d(TAG, "Reset command failed, trying reinitialization")
+            return initializeDevice()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resetting device", e)
+            return false
+        }
+    }
+
     private fun startTransaction(): Boolean {
         try {
             Log.d(TAG, "Starting transaction...")
             
-            // Send transaction start command
+            // First, ensure device is ready
+            if (!isDeviceReady()) {
+                Log.e(TAG, "Device not ready before starting transaction")
+                return false
+            }
+            
+            Thread.sleep(2000) // Longer delay before starting transaction
+            
+            // Send a basic transaction start command
             val startCommand = byteArrayOf(
                 0x02, // STX
                 0x54, // 'T'
@@ -429,7 +646,7 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
             
             if (startResult != null && startResult > 0) {
                 // Wait for start response
-                Thread.sleep(1000)
+                Thread.sleep(2000)
                 
                 val responseBuffer = ByteArray(1024)
                 val responseResult = usbConnection?.bulkTransfer(usbEndpointIn, responseBuffer, responseBuffer.size, TIMEOUT)
@@ -437,11 +654,45 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                 
                 if (responseResult != null && responseResult > 0) {
                     Log.d(TAG, "Start response bytes: ${responseBuffer.take(responseResult).joinToString(", ") { String.format("0x%02X", it) }}")
-                    return true
+                    
+                    // Check if response is valid
+                    if (responseResult >= 8 && responseBuffer[0] == 0xCD.toByte() && responseBuffer[1] == 0xCD.toByte()) {
+                        Log.d(TAG, "Transaction started successfully")
+                        return true
+                    } else {
+                        Log.d(TAG, "Invalid transaction start response format")
+                    }
+                } else {
+                    Log.d(TAG, "No response from transaction start command")
+                }
+            } else {
+                Log.d(TAG, "Failed to send transaction start command")
+            }
+            
+            // If we get here, something went wrong - try to reset the device
+            Log.d(TAG, "Transaction start failed, attempting device reset")
+            if (resetDevice()) {
+                Log.d(TAG, "Device reset successful, trying one more time")
+                Thread.sleep(2000)
+                
+                // Try one more time after reset
+                val retryResult = usbConnection?.bulkTransfer(usbEndpointOut, startCommand, startCommand.size, TIMEOUT)
+                if (retryResult != null && retryResult > 0) {
+                    Thread.sleep(2000)
+                    val retryResponseBuffer = ByteArray(1024)
+                    val retryResponseResult = usbConnection?.bulkTransfer(usbEndpointIn, retryResponseBuffer, retryResponseBuffer.size, TIMEOUT)
+                    
+                    if (retryResponseResult != null && retryResponseResult > 0) {
+                        Log.d(TAG, "Retry response bytes: ${retryResponseBuffer.take(retryResponseResult).joinToString(", ") { String.format("0x%02X", it) }}")
+                        if (retryResponseResult >= 8 && retryResponseBuffer[0] == 0xCD.toByte() && retryResponseBuffer[1] == 0xCD.toByte()) {
+                            Log.d(TAG, "Transaction started successfully after reset")
+                            return true
+                        }
+                    }
                 }
             }
             
-            Log.e(TAG, "Transaction start failed")
+            Log.e(TAG, "Transaction start failed after reset attempt")
             return false
         } catch (e: Exception) {
             Log.e(TAG, "Error starting transaction", e)
@@ -511,7 +762,7 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
         try {
             Log.d(TAG, "Setting payment mode...")
             
-            // Send payment mode command
+            // Send a simpler payment mode command
             val modeCommand = byteArrayOf(
                 0x02, // STX
                 0x4D, // 'M'
@@ -519,17 +770,9 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                 0x44, // 'D'
                 0x45, // 'E'
                 0x1C, // FS
+                0x55, // 'U'
+                0x50, // 'P'
                 0x49, // 'I'
-                0x4E, // 'N'
-                0x54, // 'T'
-                0x45, // 'E'
-                0x52, // 'R'
-                0x41, // 'A'
-                0x43, // 'C'
-                0x54, // 'T'
-                0x49, // 'I'
-                0x56, // 'V'
-                0x45, // 'E'
                 0x1C, // FS
                 0x03  // ETX
             )
@@ -540,7 +783,7 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
             
             if (modeResult != null && modeResult > 0) {
                 // Wait for mode response
-                Thread.sleep(1000)
+                Thread.sleep(2000)
                 
                 val responseBuffer = ByteArray(1024)
                 val responseResult = usbConnection?.bulkTransfer(usbEndpointIn, responseBuffer, responseBuffer.size, TIMEOUT)
@@ -548,17 +791,45 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                 
                 if (responseResult != null && responseResult > 0) {
                     Log.d(TAG, "Mode response bytes: ${responseBuffer.take(responseResult).joinToString(", ") { String.format("0x%02X", it) }}")
-                    return true
+                    
+                    // Check if response is valid
+                    if (responseResult >= 8 && responseBuffer[0] == 0xCD.toByte() && responseBuffer[1] == 0xCD.toByte()) {
+                        Log.d(TAG, "Payment mode set successfully")
+                        return true
+                    } else {
+                        Log.d(TAG, "Invalid payment mode response format")
+                    }
+                } else {
+                    Log.d(TAG, "No response from payment mode command")
+                }
+            } else {
+                Log.d(TAG, "Failed to send payment mode command")
+            }
+            
+            // If we get here, something went wrong - try to reset the device
+            Log.d(TAG, "Payment mode set failed, attempting device reset")
+            if (resetDevice()) {
+                Log.d(TAG, "Device reset successful, trying one more time")
+                Thread.sleep(2000)
+                
+                // Try one more time after reset
+                val retryResult = usbConnection?.bulkTransfer(usbEndpointOut, modeCommand, modeCommand.size, TIMEOUT)
+                if (retryResult != null && retryResult > 0) {
+                    Thread.sleep(2000)
+                    val retryResponseBuffer = ByteArray(1024)
+                    val retryResponseResult = usbConnection?.bulkTransfer(usbEndpointIn, retryResponseBuffer, retryResponseBuffer.size, TIMEOUT)
+                    
+                    if (retryResponseResult != null && retryResponseResult > 0) {
+                        Log.d(TAG, "Retry response bytes: ${retryResponseBuffer.take(retryResponseResult).joinToString(", ") { String.format("0x%02X", it) }}")
+                        if (retryResponseResult >= 8 && retryResponseBuffer[0] == 0xCD.toByte() && retryResponseBuffer[1] == 0xCD.toByte()) {
+                            Log.d(TAG, "Payment mode set successfully after reset")
+                            return true
+                        }
+                    }
                 }
             }
             
-            // If we can't get a response, assume success if command was sent
-            if (modeResult != null && modeResult > 0) {
-                Log.d(TAG, "No mode response, assuming success")
-                return true
-            }
-            
-            Log.e(TAG, "Payment mode set failed")
+            Log.e(TAG, "Payment mode set failed after reset attempt")
             return false
         } catch (e: Exception) {
             Log.e(TAG, "Error setting payment mode", e)
@@ -709,152 +980,34 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                 return
             }
             
-            Thread.sleep(1000) // Wait after ready check
+            Thread.sleep(2000) // Longer delay after ready check
             
-            // Start transaction with simplified command
-            val startCommand = byteArrayOf(
-                0x02, // STX
-                0x54, // 'T'
-                0x52, // 'R'
-                0x41, // 'A'
-                0x4E, // 'N'
-                0x53, // 'S'
-                0x1C, // FS
-                0x03  // ETX
-            )
-            
-            Log.d(TAG, "Sending transaction start command: ${startCommand.joinToString(", ") { String.format("0x%02X", it) }}")
-            val startResult = usbConnection?.bulkTransfer(usbEndpointOut, startCommand, startCommand.size, TIMEOUT)
-            Log.d(TAG, "Transaction start command result: $startResult")
-            
-            if (startResult == null || startResult <= 0) {
-                Log.e(TAG, "Failed to send transaction start command")
+            // Start transaction
+            if (!startTransaction()) {
+                Log.e(TAG, "Failed to start transaction")
                 channel.invokeMethod("onError", "Failed to start transaction. Please try again.")
-                return
-            }
-            
-            // Wait for response
-            Thread.sleep(1000)
-            val responseBuffer = ByteArray(1024)
-            val responseResult = usbConnection?.bulkTransfer(usbEndpointIn, responseBuffer, responseBuffer.size, TIMEOUT)
-            Log.d(TAG, "Transaction start response result: $responseResult")
-            
-            if (responseResult == null || responseResult <= 0) {
-                Log.e(TAG, "No response from transaction start command")
-                channel.invokeMethod("onError", "Device not responding. Please try again.")
-                return
-            }
-            
-            Log.d(TAG, "Transaction start response: ${responseBuffer.take(responseResult).joinToString(", ") { String.format("0x%02X", it) }}")
-            
-            // Verify transaction start response
-            if (responseResult < 8 || responseBuffer[0] != 0xCD.toByte() || responseBuffer[1] != 0xCD.toByte()) {
-                Log.e(TAG, "Invalid transaction start response")
-                channel.invokeMethod("onError", "Invalid response from device. Please try again.")
                 return
             }
             
             Thread.sleep(1000) // Wait after transaction start
             
-            // Set transaction type with simplified command
-            val typeCommand = byteArrayOf(
-                0x02, // STX
-                0x53, // 'S'
-                0x41, // 'A'
-                0x4C, // 'L'
-                0x45, // 'E'
-                0x1C, // FS
-                0x03  // ETX
-            )
-            
-            Log.d(TAG, "Sending transaction type command: ${typeCommand.joinToString(", ") { String.format("0x%02X", it) }}")
-            val typeResult = usbConnection?.bulkTransfer(usbEndpointOut, typeCommand, typeCommand.size, TIMEOUT)
-            Log.d(TAG, "Transaction type command result: $typeResult")
-            
-            if (typeResult == null || typeResult <= 0) {
-                Log.e(TAG, "Failed to send transaction type command")
+            // Set transaction type
+            if (!setTransactionType()) {
+                Log.e(TAG, "Failed to set transaction type")
+                cancelTransaction() // Try to cancel the transaction
                 channel.invokeMethod("onError", "Failed to set transaction type. Please try again.")
-                return
-            }
-            
-            // Wait for response
-            Thread.sleep(1000)
-            val typeResponseBuffer = ByteArray(1024)
-            val typeResponseResult = usbConnection?.bulkTransfer(usbEndpointIn, typeResponseBuffer, typeResponseBuffer.size, TIMEOUT)
-            Log.d(TAG, "Transaction type response result: $typeResponseResult")
-            
-            if (typeResponseResult == null || typeResponseResult <= 0) {
-                Log.e(TAG, "No response from transaction type command")
-                channel.invokeMethod("onError", "Device not responding. Please try again.")
-                return
-            }
-            
-            Log.d(TAG, "Transaction type response: ${typeResponseBuffer.take(typeResponseResult).joinToString(", ") { String.format("0x%02X", it) }}")
-            
-            // Verify transaction type response
-            if (typeResponseResult < 8 || typeResponseBuffer[0] != 0xCD.toByte() || typeResponseBuffer[1] != 0xCD.toByte()) {
-                Log.e(TAG, "Invalid transaction type response")
-                channel.invokeMethod("onError", "Invalid response from device. Please try again.")
                 return
             }
             
             Thread.sleep(1000) // Wait after transaction type
             
             // Set payment mode
-            val modeCommand = byteArrayOf(
-                0x02, // STX
-                0x4D, // 'M'
-                0x4F, // 'O'
-                0x44, // 'D'
-                0x45, // 'E'
-                0x1C, // FS
-                0x49, // 'I'
-                0x4E, // 'N'
-                0x54, // 'T'
-                0x45, // 'E'
-                0x52, // 'R'
-                0x41, // 'A'
-                0x43, // 'C'
-                0x54, // 'T'
-                0x49, // 'I'
-                0x56, // 'V'
-                0x45, // 'E'
-                0x1C, // FS
-                0x03  // ETX
-            )
-            
-            Log.d(TAG, "Sending payment mode command: ${modeCommand.joinToString(", ") { String.format("0x%02X", it) }}")
-            val modeResult = usbConnection?.bulkTransfer(usbEndpointOut, modeCommand, modeCommand.size, TIMEOUT)
-            Log.d(TAG, "Payment mode command result: $modeResult")
-            
-            if (modeResult == null || modeResult <= 0) {
-                Log.e(TAG, "Failed to send payment mode command")
+            if (!setPaymentMode()) {
+                Log.e(TAG, "Failed to set payment mode")
+                cancelTransaction() // Try to cancel the transaction
                 channel.invokeMethod("onError", "Failed to set payment mode. Please try again.")
                 return
             }
-            
-            // Wait for response
-            Thread.sleep(1000)
-            val modeResponseBuffer = ByteArray(1024)
-            val modeResponseResult = usbConnection?.bulkTransfer(usbEndpointIn, modeResponseBuffer, modeResponseBuffer.size, TIMEOUT)
-            Log.d(TAG, "Payment mode response result: $modeResponseResult")
-            
-            if (modeResponseResult == null || modeResponseResult <= 0) {
-                Log.e(TAG, "No response from payment mode command")
-                channel.invokeMethod("onError", "Device not responding. Please try again.")
-                return
-            }
-            
-            Log.d(TAG, "Payment mode response: ${modeResponseBuffer.take(modeResponseResult).joinToString(", ") { String.format("0x%02X", it) }}")
-            
-            // Verify payment mode response
-            if (modeResponseResult < 8 || modeResponseBuffer[0] != 0xCD.toByte() || modeResponseBuffer[1] != 0xCD.toByte()) {
-                Log.e(TAG, "Invalid payment mode response")
-                channel.invokeMethod("onError", "Invalid response from device. Please try again.")
-                return
-            }
-            
-            Thread.sleep(1000) // Wait after payment mode
             
             // Format and send payment command
             val paymentCommand = formatPaymentCommand(amount, paymentType)
@@ -866,6 +1019,7 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
             
             if (paymentResult == null || paymentResult <= 0) {
                 Log.e(TAG, "Failed to send payment command")
+                cancelTransaction() // Try to cancel the transaction
                 channel.invokeMethod("onError", "Failed to send payment command. Please try again.")
                 return
             }
@@ -882,6 +1036,7 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                         "response" to "Payment request sent successfully"
                     ))
                 } else {
+                    cancelTransaction() // Try to cancel the transaction
                     channel.invokeMethod("onPaymentInitiated", mapOf<String, Any>(
                         "amount" to amount,
                         "paymentType" to paymentType,
@@ -890,6 +1045,7 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                     ))
                 }
             } else {
+                cancelTransaction() // Try to cancel the transaction
                 channel.invokeMethod("onPaymentInitiated", mapOf<String, Any>(
                     "amount" to amount,
                     "paymentType" to paymentType,
@@ -899,6 +1055,7 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
             }
         } catch (e: Exception) {
             Log.e(TAG, "Payment initiation failed", e)
+            cancelTransaction() // Try to cancel the transaction
             channel.invokeMethod("onError", "Payment initiation failed: ${e.message}")
         }
     }

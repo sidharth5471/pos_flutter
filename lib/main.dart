@@ -1,6 +1,7 @@
 import 'dart:developer';
 
 import 'package:flutter/material.dart';
+
 import 'services/pos_service.dart';
 
 void main() {
@@ -32,7 +33,6 @@ class PaymentPage extends StatefulWidget {
 
 class _PaymentPageState extends State<PaymentPage> {
   final _formKey = GlobalKey<FormState>();
-  final _amountController = TextEditingController();
   String _selectedPaymentType = 'UPI';
   final _posService = POSService();
   bool _isLoading = false;
@@ -82,7 +82,6 @@ class _PaymentPageState extends State<PaymentPage> {
 
   Future<void> _handlePayment() async {
     log('handlePayment');
-    if (!_formKey.currentState!.validate()) return;
 
     if (_isLoading) {
       log('Payment already in progress');
@@ -113,7 +112,7 @@ class _PaymentPageState extends State<PaymentPage> {
       log('Connected to device');
 
       // Initiate payment
-      final amount = double.parse(_amountController.text);
+      final amount = double.parse("100.00");
       log('Initiating payment for amount: $amount');
       await _posService.initiatePayment(
         amount,
@@ -147,24 +146,25 @@ class _PaymentPageState extends State<PaymentPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              TextFormField(
-                controller: _amountController,
-                decoration: const InputDecoration(
-                  labelText: 'Amount',
-                  prefixText: '₹ ',
-                  border: OutlineInputBorder(),
-                ),
-                keyboardType: TextInputType.number,
-                validator: (value) {
-                  if (value == null || value.isEmpty) {
-                    return 'Please enter an amount';
-                  }
-                  if (double.tryParse(value) == null) {
-                    return 'Please enter a valid amount';
-                  }
-                  return null;
-                },
-              ),
+              Text('Amount: 100'),
+              // TextFormField(
+              //   controller: _amountController,
+              //   decoration: const InputDecoration(
+              //     labelText: 'Amount',
+              //     prefixText: '₹ ',
+              //     border: OutlineInputBorder(),
+              //   ),
+              //   keyboardType: TextInputType.number,
+              //   validator: (value) {
+              //     if (value == null || value.isEmpty) {
+              //       return 'Please enter an amount';
+              //     }
+              //     if (double.tryParse(value) == null) {
+              //       return 'Please enter a valid amount';
+              //     }
+              //     return null;
+              //   },
+              // ),
               const SizedBox(height: 16),
               DropdownButtonFormField<String>(
                 value: _selectedPaymentType,
@@ -215,7 +215,6 @@ class _PaymentPageState extends State<PaymentPage> {
 
   @override
   void dispose() {
-    _amountController.dispose();
     super.dispose();
   }
 }

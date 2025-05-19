@@ -9,6 +9,8 @@ class POSService {
   static final POSService _instance = POSService._internal();
   bool _isPaymentInProgress = false;
   bool _isDeviceConnected = false;
+  String? _connectedDeviceType;
+  String? _connectedDeviceId;
 
   factory POSService() {
     return _instance;
@@ -24,11 +26,6 @@ class POSService {
       );
       log('Received devices from platform: $devices');
 
-      if (devices == null) {
-        log('No devices returned from platform');
-        return [];
-      }
-
       return devices.map((device) {
         final Map<Object?, Object?> rawDevice = device as Map<Object?, Object?>;
         return rawDevice.map((key, value) => MapEntry(key.toString(), value));
@@ -43,20 +40,23 @@ class POSService {
     }
   }
 
-  Future<void> connectToDevice(int deviceId) async {
+  Future<void> connectToDevice(dynamic deviceId) async {
     try {
       log('Connecting to device: $deviceId');
       await _channel.invokeMethod('connectToDevice', {'deviceId': deviceId});
       log('Successfully connected to device');
       _isDeviceConnected = true;
+      _connectedDeviceId = deviceId.toString();
     } on PlatformException catch (e) {
       log('Platform exception in connectToDevice: ${e.message}');
       _isDeviceConnected = false;
+      _connectedDeviceId = null;
       throw Exception(e.message ?? 'Failed to connect to device');
     } catch (e, stackTrace) {
       log('Error in connectToDevice: $e');
       log('Stack trace: $stackTrace');
       _isDeviceConnected = false;
+      _connectedDeviceId = null;
       throw Exception('Failed to connect to device: $e');
     }
   }
@@ -103,7 +103,9 @@ class POSService {
       switch (call.method) {
         case 'onDeviceConnected':
           _isDeviceConnected = true;
-          callback(call.arguments);
+          final args = call.arguments as Map<String, dynamic>;
+          _connectedDeviceType = args['connectionType'] as String?;
+          callback(args);
           break;
         case 'onError':
           log('Error from platform: ${call.arguments}');
@@ -129,4 +131,8 @@ class POSService {
       }
     });
   }
+
+  bool get isDeviceConnected => _isDeviceConnected;
+  String? get connectedDeviceType => _connectedDeviceType;
+  String? get connectedDeviceId => _connectedDeviceId;
 }
