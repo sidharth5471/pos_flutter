@@ -13,6 +13,7 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 
 class POSBridge(private val context: Context, private val channel: MethodChannel) {
@@ -24,50 +25,23 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
     private var usbEndpointOut: UsbEndpoint? = null
     private var usbEndpointIn: UsbEndpoint? = null
     private var isDeviceInitialized = false
-    private val executor = Executors.newSingleThreadExecutor()
+    private val executor = Executors.newFixedThreadPool(10)
+    private var lastConnectedDeviceId: Int? = null
+    private var lastConnectedDeviceType: String? = null
+    private var lastConnectedIpAddress: String? = null
+    private var _isDeviceConnected = false
+    private val TIMEOUT = 5000
+    private val NETWORK_PORT = 9100
+    private val NETWORK_PORTS = listOf(9100, 9101, 9102, 9103, 9104, 9105)
+    private val NETWORK_TIMEOUT = 300
 
     init {
         usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     }
 
-    fun scanForDevices(): List<Map<String, Any>> {
-        val devices = ArrayList<Map<String, Any>>()
-        
-        // First scan USB devices
-        try {
-            val usbDevices = scanUsbDevices()
-            devices.addAll(usbDevices)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error scanning USB devices", e)
-        }
-
-        // Then scan network devices
-        try {
-            val networkDevices = scanNetworkDevices()
-            devices.addAll(networkDevices)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error scanning network devices", e)
-        }
-
-        return devices
-    }
-
-    private fun scanUsbDevices(): List<Map<String, Any>> {
-        val devices = ArrayList<Map<String, Any>>()
-        val deviceList = usbManager?.deviceList ?: emptyMap()
-
-        Log.d(TAG, "Scanning for USB devices...")
-        Log.d(TAG, "Found ${deviceList.size} USB devices")
-
-        if (deviceList.isEmpty()) {
-            Log.e(TAG, "No USB devices found")
-            return emptyList()
-        }
-
-        deviceList.values.forEach { device ->
-            Log.d(TAG, "Checking device: ${device.deviceName} (Vendor ID: ${device.vendorId}, Product ID: ${device.productId})")
-            
-            val deviceInfo = mapOf<String, Any>(
+    private fun createDeviceInfo(device: UsbDevice? = null, ipAddress: String? = null): Map<String, Any>? {
+        return when {
+            device != null -> mapOf(
                 "deviceId" to device.deviceId,
                 "deviceName" to (device.deviceName ?: "Unknown Device"),
                 "manufacturerName" to (device.manufacturerName ?: "Unknown Manufacturer"),
@@ -79,87 +53,132 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                 "deviceProtocol" to device.deviceProtocol,
                 "connectionType" to "USB"
             )
-            Log.d(TAG, "Found device: $deviceInfo")
-            devices.add(deviceInfo)
+            ipAddress != null -> mapOf(
+                "deviceId" to ipAddress.hashCode(),
+                "deviceName" to "Pine Labs Device",
+                "ipAddress" to ipAddress,
+                "port" to NETWORK_PORT,
+                "connectionType" to "NETWORK"
+            )
+            else -> null
+        }
+    }
+
+    fun scanForDevices(): List<Map<String, Any>> {
+        // If already connected, return current device
+        if (_isDeviceConnected && lastConnectedDeviceId != null) {
+            Log.d(TAG, "Device already connected, returning current device")
+            return createDeviceInfo(usbDevice, lastConnectedIpAddress)?.let { listOf(it) } ?: emptyList()
         }
 
-        return devices
+        // Scan for new devices without attempting connections
+        return try {
+            val devices = mutableListOf<Map<String, Any>>()
+            devices.addAll(scanUsbDevices())
+            devices.addAll(scanNetworkDevices())
+            devices
+        } catch (e: Exception) {
+            Log.e(TAG, "Error scanning devices", e)
+            emptyList()
+        }
+    }
+
+    private fun scanUsbDevices(): List<Map<String, Any>> {
+        val deviceList = usbManager?.deviceList ?: return emptyList()
+        Log.d(TAG, "Scanning for USB devices... Found ${deviceList.size} devices")
+
+        return deviceList.values.mapNotNull { device ->
+            try {
+                Log.d(TAG, "Checking device: ${device.deviceName}")
+                createDeviceInfo(device)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error processing USB device", e)
+                null
+            }
+        }
     }
 
     private fun scanNetworkDevices(): List<Map<String, Any>> {
         val devices = Collections.synchronizedList(ArrayList<Map<String, Any>>())
         val networkInterfaces = NetworkInterface.getNetworkInterfaces()
-        val executor = Executors.newFixedThreadPool(10) // Use more threads for faster scanning
         
-        Log.d(TAG, "Scanning for network devices...")
+        Log.d(TAG, "Starting network device scan...")
 
         while (networkInterfaces.hasMoreElements()) {
             val networkInterface = networkInterfaces.nextElement()
-            
-            // Skip loopback and inactive interfaces
             if (networkInterface.isLoopback || !networkInterface.isUp) {
+                Log.d(TAG, "Skipping interface: ${networkInterface.displayName} (loopback: ${networkInterface.isLoopback}, up: ${networkInterface.isUp})")
                 continue
             }
 
-            val interfaceAddresses = networkInterface.inetAddresses
-            while (interfaceAddresses.hasMoreElements()) {
-                val address = interfaceAddresses.nextElement()
-                
-                // Only scan IPv4 addresses
-                if (address.hostAddress.contains(":")) {
-                    continue
-                }
-
-                val baseAddress = address.hostAddress.substring(0, address.hostAddress.lastIndexOf(".") + 1)
-                Log.d(TAG, "Scanning network interface: $baseAddress")
-                
-                // Scan the local network (last octet 1-254)
-                for (i in 1..254) {
-                    val targetAddress = "$baseAddress$i"
-                    executor.submit {
+            Log.d(TAG, "Scanning interface: ${networkInterface.displayName}")
+            networkInterface.inetAddresses.asSequence()
+                .filter { !it.hostAddress.contains(":") }
+                .forEach { address ->
+                    val baseAddress = address.hostAddress.substring(0, address.hostAddress.lastIndexOf(".") + 1)
+                    Log.d(TAG, "Scanning network range: $baseAddress*")
+                    
+                    // Scan the entire range (1-254) for the subnet
+                    for (i in 1..254) {
+                        val targetAddress = "$baseAddress$i"
                         try {
-                            val inetAddress = InetAddress.getByName(targetAddress)
-                            if (inetAddress.isReachable(500)) { // Reduced timeout for faster scanning
-                                Log.d(TAG, "Found reachable device at $targetAddress")
-                                // Try to connect to Pine Labs device port (default: 9100)
-                                val socket = java.net.Socket()
+                            Log.d(TAG, "Checking IP: $targetAddress")
+                            
+                            // Try to connect to common POS ports
+                            for (port in NETWORK_PORTS) {
                                 try {
-                                    socket.connect(java.net.InetSocketAddress(inetAddress, 9100), 500)
-                                    val deviceInfo = mapOf<String, Any>(
-                                        "deviceId" to targetAddress.hashCode(),
-                                        "deviceName" to "Pine Labs Device",
-                                        "ipAddress" to targetAddress,
-                                        "port" to 9100,
-                                        "connectionType" to "NETWORK"
-                                    )
-                                    devices.add(deviceInfo)
-                                    Log.d(TAG, "Found network device: $deviceInfo")
-                                } catch (e: Exception) {
-                                    Log.d(TAG, "Device at $targetAddress is not a Pine Labs device: ${e.message}")
-                                } finally {
+                                    val socket = java.net.Socket()
+                                    socket.connect(java.net.InetSocketAddress(targetAddress, port), 100)
+                                    Log.d(TAG, "Device at $targetAddress responded on port $port")
+                                    
+                                    // Try to identify if it's a Pine Labs device
                                     try {
-                                        socket.close()
+                                        val outputStream = socket.getOutputStream()
+                                        val inputStream = socket.getInputStream()
+                                        
+                                        // Send a simple status command
+                                        val statusCommand = byteArrayOf(
+                                            0x02, // STX
+                                            0x53, // 'S'
+                                            0x54, // 'T'
+                                            0x41, // 'A'
+                                            0x54, // 'T'
+                                            0x55, // 'U'
+                                            0x53, // 'S'
+                                            0x1C, // FS
+                                            0x03  // ETX
+                                        )
+                                        
+                                        outputStream.write(statusCommand)
+                                        outputStream.flush()
+                                        
+                                        // Read response
+                                        val responseBuffer = ByteArray(1024)
+                                        val bytesRead = inputStream.read(responseBuffer)
+                                        
+                                        if (bytesRead > 0) {
+                                            Log.d(TAG, "Received response from $targetAddress: ${responseBuffer.take(bytesRead).joinToString(", ") { String.format("0x%02X", it) }}")
+                                            createDeviceInfo(ipAddress = targetAddress)?.let { devices.add(it) }
+                                            Log.d(TAG, "Added Pine Labs device at $targetAddress")
+                                        }
                                     } catch (e: Exception) {
-                                        // Ignore close errors
+                                        Log.d(TAG, "Error communicating with device at $targetAddress: ${e.message}")
+                                    } finally {
+                                        socket.close()
                                     }
+                                    break // Found a responding port, no need to check others
+                                } catch (e: Exception) {
+                                    // Skip unreachable ports silently
                                 }
                             }
                         } catch (e: Exception) {
-                            // Skip unreachable addresses
+                            Log.d(TAG, "Error checking IP $targetAddress: ${e.message}")
                         }
                     }
                 }
-            }
         }
 
-        // Wait for all scans to complete (with timeout)
-        executor.shutdown()
-        if (!executor.awaitTermination(15, TimeUnit.SECONDS)) { // Increased timeout
-            Log.w(TAG, "Network scan timed out, returning partial results")
-            executor.shutdownNow()
-        }
-
-        Log.d(TAG, "Network scan complete, found ${devices.size} devices")
+        Log.d(TAG, "Network scan complete, found ${devices.size} potential devices")
         return devices
     }
 
@@ -212,6 +231,9 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
 
     fun connectToDevice(deviceId: Int) {
         try {
+            // Store the device ID for future reconnection attempts
+            lastConnectedDeviceId = deviceId
+            
             val deviceList = usbManager?.deviceList ?: emptyMap()
             usbDevice = deviceList.values.find { it.deviceId == deviceId }
             
@@ -285,9 +307,11 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
                         if (claimed == true) {
                             // Initialize the device
                             if (initializeDevice()) {
+                                lastConnectedDeviceType = "USB"
                                 channel.invokeMethod("onDeviceConnected", mapOf<String, Any>(
                                     "deviceId" to usbDevice!!.deviceId,
-                                    "deviceName" to (usbDevice!!.deviceName ?: "Unknown Device")
+                                    "deviceName" to (usbDevice!!.deviceName ?: "Unknown Device"),
+                                    "connectionType" to "USB"
                                 ))
                             } else {
                                 Log.e(TAG, "Device initialization failed")
@@ -397,6 +421,89 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
         } catch (e: Exception) {
             Log.e(TAG, "Error connecting to device", e)
             channel.invokeMethod("onError", "Error connecting to device: ${e.message}")
+        }
+    }
+
+    private fun checkAndReconnectLastDevice(): Boolean {
+        return when (lastConnectedDeviceType) {
+            "USB" -> checkAndReconnectUsbDevice()
+            "NETWORK" -> checkAndReconnectNetworkDevice()
+            else -> false
+        }
+    }
+
+    private fun checkAndReconnectUsbDevice(): Boolean {
+        if (lastConnectedDeviceId == null) return false
+
+        return try {
+            val device = usbManager?.deviceList?.values?.find { it.deviceId == lastConnectedDeviceId }
+                ?: return false
+
+            if (!usbManager?.hasPermission(device)!!) return false
+
+            usbConnection = usbManager?.openDevice(device) ?: return false
+            val endpoints = findUsbEndpoints(device) ?: return false
+
+            usbInterface = endpoints.first
+            usbEndpointOut = endpoints.second
+            usbEndpointIn = endpoints.third
+
+            val claimed = usbConnection?.claimInterface(usbInterface, true) ?: false
+            if (!claimed) return false
+
+            initializeDevice()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reconnecting to USB device", e)
+            false
+        }
+    }
+
+    private fun findUsbEndpoints(device: UsbDevice): Triple<UsbInterface, UsbEndpoint, UsbEndpoint>? {
+        for (i in 0 until device.interfaceCount) {
+            val currentInterface = device.getInterface(i)
+            if (currentInterface.name?.contains("ADB", ignoreCase = true) == true) continue
+
+            var endpointOut: UsbEndpoint? = null
+            var endpointIn: UsbEndpoint? = null
+
+            for (j in 0 until currentInterface.endpointCount) {
+                val endpoint = currentInterface.getEndpoint(j)
+                if (endpoint.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+
+                when (endpoint.direction) {
+                    UsbConstants.USB_DIR_OUT -> endpointOut = endpoint
+                    UsbConstants.USB_DIR_IN -> endpointIn = endpoint
+                }
+
+                if (endpointOut != null && endpointIn != null) {
+                    return Triple(currentInterface, endpointOut, endpointIn)
+                }
+            }
+        }
+        return null
+    }
+
+    private fun checkAndReconnectNetworkDevice(): Boolean {
+        if (lastConnectedIpAddress == null) return false
+
+        return try {
+            val inetAddress = InetAddress.getByName(lastConnectedIpAddress)
+            if (!inetAddress.isReachable(1000)) return false
+
+            val socket = java.net.Socket()
+            try {
+                socket.connect(java.net.InetSocketAddress(inetAddress, NETWORK_PORT), 1000)
+                true
+            } finally {
+                try {
+                    socket.close()
+                } catch (e: Exception) {
+                    // Ignore close errors
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reconnecting to network device", e)
+            false
         }
     }
 
@@ -1137,7 +1244,6 @@ class POSBridge(private val context: Context, private val channel: MethodChannel
 
     companion object {
         const val ACTION_USB_PERMISSION = "com.example.pinelabs.USB_PERMISSION"
-        private const val TIMEOUT = 5000
 
         private var permissionCallback: ((UsbDevice) -> Unit)? = null
         private var permissionDeniedCallback: (() -> Unit)? = null

@@ -23,13 +23,49 @@ class POSService {
       log('Invoking scanForDevices method');
       final List<dynamic> devices = await _channel.invokeMethod(
         'scanForDevices',
+        {'scanOnly': true},
       );
       log('Received devices from platform: $devices');
 
-      return devices.map((device) {
-        final Map<Object?, Object?> rawDevice = device as Map<Object?, Object?>;
-        return rawDevice.map((key, value) => MapEntry(key.toString(), value));
-      }).toList();
+      if (devices.isEmpty) {
+        log('No devices found');
+        return [];
+      }
+
+      // Filter and map devices
+      return devices
+          .map((device) {
+            final Map<Object?, Object?> rawDevice =
+                device as Map<Object?, Object?>;
+            final Map<String, dynamic> mappedDevice = rawDevice.map(
+              (key, value) => MapEntry(key.toString(), value),
+            );
+
+            // Add connection type if not present
+            if (!mappedDevice.containsKey('connectionType')) {
+              mappedDevice['connectionType'] = 'USB';
+            }
+
+            // Add device type based on manufacturer
+            if (mappedDevice.containsKey('manufacturerName')) {
+              final manufacturer = mappedDevice['manufacturerName'] as String;
+              if (manufacturer.toUpperCase().contains('PAX')) {
+                mappedDevice['deviceType'] = 'PAX';
+              } else if (manufacturer.toUpperCase().contains('PINE')) {
+                mappedDevice['deviceType'] = 'PINE';
+              }
+            }
+
+            log('Mapped device: $mappedDevice');
+            return mappedDevice;
+          })
+          .where((device) {
+            // Filter out devices that don't have required fields
+            return device.containsKey('deviceId') &&
+                device.containsKey('deviceName') &&
+                device.containsKey('manufacturerName');
+          })
+          .toList();
     } on PlatformException catch (e) {
       log('Platform exception in scanForDevices: ${e.message}');
       throw Exception(e.message ?? 'Failed to scan for devices');
@@ -41,6 +77,11 @@ class POSService {
   }
 
   Future<void> connectToDevice(dynamic deviceId) async {
+    if (_isDeviceConnected) {
+      log('Device already connected');
+      return;
+    }
+
     try {
       log('Connecting to device: $deviceId');
       await _channel.invokeMethod('connectToDevice', {'deviceId': deviceId});
